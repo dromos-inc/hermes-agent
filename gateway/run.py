@@ -1911,6 +1911,10 @@ class GatewayRunner:
                         error_message=None,
                     )
                     logger.info("✓ %s connected", platform.value)
+
+                    # Auto-join voice channel for Discord if configured
+                    if platform == Platform.DISCORD:
+                        await self._auto_join_discord_voice(adapter)
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     if adapter.has_fatal_error:
@@ -2589,6 +2593,13 @@ class GatewayRunner:
                 return None
             return WecomCallbackAdapter(config)
 
+        elif platform == Platform.WEB_CHAT:
+            from gateway.platforms.webchat import WebChatAdapter, check_webchat_requirements
+            if not check_webchat_requirements():
+                logger.warning("WebChat: aiohttp not installed")
+                return None
+            return WebChatAdapter(config)
+
         elif platform == Platform.WECOM:
             from gateway.platforms.wecom import WeComAdapter, check_wecom_requirements
             if not check_wecom_requirements():
@@ -2689,6 +2700,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.WEB_CHAT: "WEB_CHAT_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
@@ -2710,6 +2722,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.WEB_CHAT: "WEB_CHAT_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -4357,7 +4370,22 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            _voice_stream_chars = agent_result.get("voice_stream_chars", 0)
+            # If VoiceStreamTTS already streamed most of the response text,
+            # skip the monolithic _send_voice_reply to avoid repeating audio.
+            # If it streamed a partial amount, we could send only the remainder,
+            # but that adds complexity — skip entirely if >50% was streamed.
+            _voice_skip_mono = False
+            if _voice_stream_chars > 0 and response:
+                from tools.tts_tool import _strip_markdown_for_tts as _strip_md_tts
+                _response_len = len(_strip_md_tts(response[:4000]))
+                if _response_len > 0 and (_voice_stream_chars / _response_len) > 0.5:
+                    _voice_skip_mono = True
+                    logger.debug(
+                        "Skipping monolithic voice reply: %d/%d chars already streamed",
+                        _voice_stream_chars, _response_len,
+                    )
+            if not _voice_skip_mono and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -5727,6 +5755,81 @@ class GatewayRunner:
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
+    async def _auto_join_discord_voice(self, adapter) -> None:
+        """Auto-join a configured voice channel after Discord connects.
+
+        Triggered by DISCORD_VOICE_AUTO_JOIN (channel ID) env var.
+        Wires all callbacks so voice input is processed immediately.
+        """
+        import os
+        voice_ch_id = os.getenv("DISCORD_VOICE_AUTO_JOIN", "").strip()
+        if not voice_ch_id:
+            return
+
+        try:
+            voice_ch_id = int(voice_ch_id)
+        except ValueError:
+            logger.warning("DISCORD_VOICE_AUTO_JOIN is not a valid channel ID: %s", voice_ch_id)
+            return
+
+        # Wait for adapter to fully initialize (slash commands sync, etc.)
+        await asyncio.sleep(2)
+
+        ch = adapter._client.get_channel(voice_ch_id)
+        if not ch or not hasattr(ch, "connect"):
+            logger.warning("Auto-join: channel %s not found or not a voice channel", voice_ch_id)
+            return
+
+        guild_id = ch.guild.id
+
+        # Wire callbacks BEFORE joining
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+
+        try:
+            success = await adapter.join_voice_channel(ch)
+        except Exception as e:
+            logger.warning("Auto-join voice channel failed: %s", e)
+            adapter._voice_input_callback = None
+            return
+
+        if success:
+            # Link a text channel for voice input events
+            text_ch_id = os.getenv("DISCORD_VOICE_AUTO_JOIN_TEXT_CHANNEL", "").strip()
+            if text_ch_id:
+                try:
+                    adapter._voice_text_channels[guild_id] = int(text_ch_id)
+                except ValueError:
+                    pass
+
+            # Store source metadata from the text channel
+            text_ch = None
+            if text_ch_id:
+                text_ch = adapter._client.get_channel(int(text_ch_id))
+            if text_ch:
+                adapter._voice_sources[guild_id] = SessionSource(
+                    platform=Platform.DISCORD,
+                    chat_id=str(text_ch.id),
+                    user_id="auto_join",
+                    user_name="auto_join",
+                    chat_type="channel",
+                ).to_dict()
+
+            # Set voice mode to "all" (listen + speak)
+            chat_key = str(text_ch_id) if text_ch_id else str(voice_ch_id)
+            self._voice_mode[chat_key] = "all"
+            self._save_voice_modes()
+
+            logger.info(
+                "Auto-joined voice channel: %s (%s) in guild %s",
+                ch.name, ch.id, guild_id,
+            )
+        else:
+            adapter._voice_input_callback = None
+            logger.warning("Auto-join voice channel returned False")
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -5783,6 +5886,18 @@ class GatewayRunner:
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
         )
+
+        # --- Part A: Early acknowledgment ---
+        # Fire a short TTS acknowledgment immediately so the user hears
+        # something within ~3 seconds instead of waiting 45-90s of silence.
+        # This is non-blocking — the ack plays while the agent loop runs.
+        try:
+            from gateway.voice_stream_tts import send_early_ack
+            asyncio.ensure_future(
+                send_early_ack(adapter, guild_id, asyncio.get_running_loop())
+            )
+        except Exception:
+            pass  # non-fatal — ack is best-effort
 
         await adapter.handle_message(event)
 
@@ -9122,7 +9237,39 @@ class GatewayRunner:
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
+            # --- Part B: Voice Stream TTS ---
+            # When this is a Discord voice input and the bot is connected to a VC,
+            # create a VoiceStreamTTS instance to stream TTS chunks as the agent
+            # generates text, instead of waiting for the full response.
+            _voice_stream_tts = None
+            _voice_stream_guild_id = None
+            try:
+                if (source.platform == Platform.DISCORD
+                        and event.message_type == MessageType.VOICE):
+                    _discord_adapter = self.adapters.get(Platform.DISCORD)
+                    _guild_id = self._get_guild_id(event)
+                    if (_discord_adapter and _guild_id
+                            and hasattr(_discord_adapter, 'is_in_voice_channel')
+                            and _discord_adapter.is_in_voice_channel(_guild_id)):
+                        from gateway.voice_stream_tts import VoiceStreamTTS
+                        _voice_stream_tts = VoiceStreamTTS(
+                            adapter=_discord_adapter,
+                            guild_id=_guild_id,
+                            loop=_loop_for_step,
+                        )
+                        _voice_stream_guild_id = _guild_id
+                        logger.debug("VoiceStreamTTS active for guild %s", _guild_id)
+            except Exception as _vst_err:
+                logger.debug("VoiceStreamTTS setup failed: %s", _vst_err)
+
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                # Feed to VoiceStreamTTS if active (chunked TTS streaming to VC)
+                if _voice_stream_tts is not None:
+                    if already_streamed:
+                        _voice_stream_tts.feed_segment_break()
+                    else:
+                        _voice_stream_tts.feed_text(text)
+
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -9450,6 +9597,13 @@ class GatewayRunner:
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
+
+            # Signal VoiceStreamTTS to flush remaining buffer and finish
+            _voice_stream_chars = 0
+            if _voice_stream_tts is not None:
+                _voice_stream_tts.finish()
+                _voice_stream_chars = _voice_stream_tts.chars_streamed
+                logger.debug("VoiceStreamTTS finished, streamed %d chars", _voice_stream_chars)
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
@@ -9570,6 +9724,7 @@ class GatewayRunner:
                 "model": _resolved_model,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                "voice_stream_chars": _voice_stream_chars,
             }
         
         # Start progress message sender if enabled

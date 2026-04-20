@@ -488,7 +488,8 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
-    VOICE_TIMEOUT = 300
+    # Set to 0 to disable auto-disconnect (stay in voice channel indefinitely)
+    VOICE_TIMEOUT = 0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -1071,8 +1072,14 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         content: str,
+        *,
+        finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Discord message."""
+        """Edit a previously sent Discord message.
+
+        ``finalize`` is accepted for interface compatibility with the base
+        adapter but has no effect on Discord — edits are edits.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
@@ -1346,6 +1353,8 @@ class DiscordAdapter(BasePlatformAdapter):
         task = self._voice_timeout_tasks.pop(guild_id, None)
         if task:
             task.cancel()
+        if self.VOICE_TIMEOUT <= 0:
+            return  # auto-disconnect disabled
         self._voice_timeout_tasks[guild_id] = asyncio.ensure_future(
             self._voice_timeout_handler(guild_id)
         )
